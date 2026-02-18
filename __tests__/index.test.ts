@@ -1238,6 +1238,41 @@ describe("stub disposal over RPC", () => {
     );
   });
 
+  it("does not leak when the same RpcTarget instance appears in two fields of a result", async () => {
+    // When the same RpcTarget instance is returned in two places, RpcPayload.getHookForRpcTarget()
+    // deduplicates it (via the `rpcTargets` map) and returns dup()s of the same TargetStubHook.
+    // However, exportStub() tries to deduplicate by hook object identity, and each dup() is a
+    // fresh object, so reverseExports never matches. The result is two separate export IDs sent to
+    // the client -- which is currently correct behavior: the client releases them independently.
+    //
+    // Once exportStub() is fixed to deduplicate based on the underlying target rather than the dup
+    // object identity, the same export ID will appear twice in the payload. At that point,
+    // importStub() must also increment remoteRefcount on reuse (the bug described in the adjacent
+    // raw-message test), otherwise the client will only release count=1 instead of count=2 and
+    // the server export will be permanently leaked. This test catches that scenario: if there is a
+    // leak, harness[Symbol.asyncDispose] will fail via checkAllDisposed().
+    class SharedTarget extends RpcTarget {
+      getValue() { return 42; }
+    }
+
+    class MainTarget extends RpcTarget {
+      getSharedTwice() {
+        let shared = new SharedTarget();
+        return { a: shared, b: shared };
+      }
+    }
+
+    await using harness = new TestHarness(new MainTarget());
+    let stub = harness.stub as any;
+
+    using result = await stub.getSharedTwice();
+    expect(await result.a.getValue()).toBe(42);
+    expect(await result.b.getValue()).toBe(42);
+    // `result[Symbol.dispose]()` runs here (before harness[Symbol.asyncDispose]), releasing both
+    // the .a and .b stubs. harness[Symbol.asyncDispose] then pumps microtasks so the release
+    // messages are delivered, and calls checkAllDisposed() to verify no server exports are leaked.
+  });
+
   it("releases one reference per occurrence when the same export ID appears twice in a payload", async () => {
     // ImportTableEntry.remoteRefcount is initialized to 1 and never incremented, even when
     // importStub() reuses an existing entry for an ID it has already seen. This means that if
