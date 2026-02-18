@@ -1237,6 +1237,59 @@ describe("stub disposal over RPC", () => {
       new Error("RPC session was shut down by disposing the main stub")
     );
   });
+
+  it("only releases one reference when the same export ID appears twice in a payload", async () => {
+    // ImportTableEntry.remoteRefcount is initialized to 1 and never incremented, even when
+    // importStub() reuses an existing entry for an ID it has already seen. This means that if
+    // a peer sends the same export ID twice in one payload (which would happen if exportStub()
+    // deduplication worked correctly), the receiver will only send ["release", id, 1] instead of
+    // ["release", id, 2], leaving the peer's export refcount permanently at 1 (leaked).
+    //
+    // Note: exportStub() deduplication (via reverseExports) does not currently fire in practice
+    // because hooks passed to it are always fresh dup()s. The bug is demonstrated here via raw
+    // message injection to simulate the scenario directly.
+
+    let clientTransport = new TestTransport("client");
+    let serverTransport = new TestTransport("server", clientTransport);
+
+    // Track all messages sent by the client.
+    let clientMessages: any[] = [];
+    let origClientSend = clientTransport.send;
+    clientTransport.send = async function(this: TestTransport, message: string) {
+      clientMessages.push(JSON.parse(message));
+      return origClientSend.call(this, message);
+    };
+
+    let client = new RpcSession(clientTransport);
+
+    // Act as the server: send a push where export -1 appears twice in the same payload.
+    // This simulates a server that has correctly deduplicated a hook (export -1, refcount=2)
+    // and sent it in two places within the same value.
+    await serverTransport.send(JSON.stringify(
+      ["push", {a: ["export", -1], b: ["export", -1]}]
+    ));
+    await pumpMicrotasks();
+
+    // The push result is stored at client.exports[1] (exports[0] is the bootstrap).
+    // Client's import[-1] now has localRefcount=2, remoteRefcount=1.
+
+    // Ask the client to resolve its export[1].
+    await serverTransport.send(JSON.stringify(["pull", 1]));
+    await pumpMicrotasks();
+
+    // Release the push result, which disposes the PayloadStubHook, which disposes both
+    // RpcImportHooks for import[-1]. When the second hook's localRefcount hits 0,
+    // entry.dispose() fires and sends ["release", -1, remoteRefcount].
+    await serverTransport.send(JSON.stringify(["release", 1, 1]));
+    await pumpMicrotasks();
+
+    let releaseForMinusOne = clientMessages.filter(m => m[0] === "release" && m[1] === -1);
+    expect(releaseForMinusOne).toHaveLength(1);
+
+    // The client received export -1 twice, so the server's export has refcount=2.
+    // The release must carry count=2 so the server can fully decrement to 0.
+    expect(releaseForMinusOne[0][2]).toBe(2);
+  });
 });
 
 describe("e-order", () => {
