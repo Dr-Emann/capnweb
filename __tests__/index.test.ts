@@ -1238,7 +1238,7 @@ describe("stub disposal over RPC", () => {
     );
   });
 
-  it("only releases one reference when the same export ID appears twice in a payload", async () => {
+  it("releases one reference per occurrence when the same export ID appears twice in a payload", async () => {
     // ImportTableEntry.remoteRefcount is initialized to 1 and never incremented, even when
     // importStub() reuses an existing entry for an ID it has already seen. This means that if
     // a peer sends the same export ID twice in one payload (which would happen if exportStub()
